@@ -1,12 +1,13 @@
 use anyhow::Result;
 use std::env;
 use log::{info, warn};
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 
 use crate::config::AppConfig;
-use crate::cron_store::CronStore;
+use crate::cron_store::{CronJobInput, CronStore};
 use crate::curator;
 use crate::engine::Engine;
 use crate::llm::openai_compat::OpenAiCompatClient;
@@ -92,6 +93,11 @@ impl AgentRuntime {
             "/curator-start   -> démarrer le curator en tâche parallèle",
             "/curator-stop    -> arrêter le curator parallèle",
             "/workers         -> état des workers",
+            "/cron status     -> statut cron sqlite",
+            "/cron add-curator-nightly -> ajoute un job systemEvent 'curate' nocturne",
+            "/cron list       -> liste des jobs cron",
+            "/cron run <job_id> -> queue une exécution manuelle",
+            "/cron runs <job_id> -> historique des runs",
             "/quit            -> quitter",
         ]
         .join("\n")
@@ -126,6 +132,7 @@ impl AgentRuntime {
             "/curator-start" => RuntimeEvent::Info(self.start_curator_worker()),
             "/curator-stop" => RuntimeEvent::Info(self.stop_curator_worker()),
             "/workers" => RuntimeEvent::Info(self.workers_status()),
+            _ if msg.starts_with("/cron") => RuntimeEvent::Info(self.handle_cron_command(msg)),
             _ => self.run_user_turn(msg).await,
         }
     }
@@ -220,6 +227,87 @@ impl AgentRuntime {
         )
     }
 
+    fn handle_cron_command(&self, msg: &str) -> String {
+        let mut parts = msg.split_whitespace();
+        let _ = parts.next(); // /cron
+        match parts.next() {
+            Some("status") => format!("cron: ok\n- db: {}", self.cron_store.db_path().display()),
+            Some("list") => match self.cron_store.list_jobs(20) {
+                Ok(rows) if rows.is_empty() => "cron: aucun job".to_string(),
+                Ok(rows) => {
+                    let mut out = vec![format!("cron: {} job(s)", rows.len())];
+                    for j in rows {
+                        out.push(format!(
+                            "- {} | {} | schedule={} | payload={} | target={} | enabled={} | next={} | last={}",
+                            j.id,
+                            j.name.unwrap_or_else(|| "(sans nom)".to_string()),
+                            j.schedule_kind,
+                            j.payload_kind,
+                            j.session_target,
+                            j.enabled,
+                            j.next_run_at.unwrap_or_else(|| "-".to_string()),
+                            j.last_run_at.unwrap_or_else(|| "-".to_string())
+                        ));
+                    }
+                    out.join("\n")
+                }
+                Err(e) => format!("cron list: erreur: {e}"),
+            },
+            Some("add-curator-nightly") => {
+                let payload = json!({
+                    "type":"curate",
+                    "version":1,
+                    "data":{"mode":"incremental","window":"24h"}
+                })
+                .to_string();
+                let schedule = json!({"kind":"cron","expr":"0 2 * * *","tz":"Europe/Paris"}).to_string();
+
+                let input = CronJobInput {
+                    name: Some("curator-nightly".to_string()),
+                    schedule_kind: "cron".to_string(),
+                    schedule_json: schedule,
+                    payload_kind: "systemEvent".to_string(),
+                    payload_json: payload,
+                    session_target: "main".to_string(),
+                    next_run_at: None,
+                };
+
+                match self.cron_store.add_job(input) {
+                    Ok(job_id) => format!("cron add: ok\n- job_id: {job_id}\n- name: curator-nightly"),
+                    Err(e) => format!("cron add: erreur: {e}"),
+                }
+            }
+            Some("run") => {
+                let Some(job_id) = parts.next() else {
+                    return "usage: /cron run <job_id>".to_string();
+                };
+                match self.cron_store.trigger_run_manual(job_id) {
+                    Ok(run_id) => format!("cron run: queued\n- job_id: {job_id}\n- run_id: {run_id}"),
+                    Err(e) => format!("cron run: erreur: {e}"),
+                }
+            }
+            Some("runs") => {
+                let Some(job_id) = parts.next() else {
+                    return "usage: /cron runs <job_id>".to_string();
+                };
+                match self.cron_store.list_runs(job_id, 20) {
+                    Ok(rows) if rows.is_empty() => format!("cron runs: aucun run pour {job_id}"),
+                    Ok(rows) => {
+                        let mut out = vec![format!("cron runs: {}", job_id)];
+                        for r in rows {
+                            out.push(format!(
+                                "- {} | job={} | status={} | trigger={} | at={}",
+                                r.run_id, r.job_id, r.status, r.trigger_source, r.created_at
+                            ));
+                        }
+                        out.join("\n")
+                    }
+                    Err(e) => format!("cron runs: erreur: {e}"),
+                }
+            }
+            _ => "usage: /cron status|list|add-curator-nightly|run <job_id>|runs <job_id>".to_string(),
+        }
+    }
 
     fn drain_supervisor_events(&mut self) {
         while let Ok(ev) = self.supervisor_rx.try_recv() {
