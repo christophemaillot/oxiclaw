@@ -6,6 +6,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 
 use crate::config::AppConfig;
+use crate::cron_store::CronStore;
 use crate::curator;
 use crate::engine::Engine;
 use crate::llm::openai_compat::OpenAiCompatClient;
@@ -34,6 +35,7 @@ pub struct AgentRuntime {
     engine: Engine<OpenAiCompatClient>,
     session: Session,
     transcripts: TranscriptStore,
+    cron_store: CronStore,
     supervisor_tx: mpsc::Sender<SupervisorEvent>,
     supervisor_rx: mpsc::Receiver<SupervisorEvent>,
     curator_task: Option<JoinHandle<()>>,
@@ -65,6 +67,8 @@ impl AgentRuntime {
             .with_max_steps(cfg.max_turn_steps);
         let session = Session::new(system_prompt);
         let transcripts = TranscriptStore::new(cfg.transcripts_file.clone(), cfg.memory_index_file.clone())?;
+        let cron_store = CronStore::init(&cfg.cron_db_file)?;
+        info!("runtime:cron_db={}", cron_store.db_path().display());
         let (supervisor_tx, supervisor_rx) = mpsc::channel(256);
 
         Ok(Self {
@@ -72,6 +76,7 @@ impl AgentRuntime {
             engine,
             session,
             transcripts,
+            cron_store,
             supervisor_tx,
             supervisor_rx,
             curator_task: None,
@@ -209,7 +214,10 @@ impl AgentRuntime {
         } else {
             "stopped"
         };
-        format!("workers:\n- curator: {curator}")
+        format!(
+            "workers:\n- curator: {curator}\ncron:\n- db: {}",
+            self.cron_store.db_path().display()
+        )
     }
 
 

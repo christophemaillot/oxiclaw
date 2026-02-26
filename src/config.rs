@@ -14,6 +14,7 @@ pub struct AppConfig {
     pub conf_file: PathBuf,
     pub transcripts_file: PathBuf,
     pub memory_index_file: PathBuf,
+    pub cron_db_file: PathBuf,
     pub http_host: String,
     pub http_port: u16,
     pub telegram_enabled: bool,
@@ -115,6 +116,7 @@ impl AppConfig {
             .join("transcripts")
             .join(format!("session-{day}.jsonl"));
         let memory_index_file = basedir.join("memory").join(format!("index-{day}.json"));
+        let cron_db_file = basedir.join("state").join("cron.sqlite");
 
         let telegram_enabled = env::var("OXICLAW_TELEGRAM_ENABLED").or_else(|_| env::var("GRIFFE_TELEGRAM_ENABLED"))
             .ok()
@@ -142,6 +144,7 @@ impl AppConfig {
             conf_file,
             transcripts_file,
             memory_index_file,
+            cron_db_file,
             http_host: http_cfg.host,
             http_port: http_cfg.port,
             telegram_enabled,

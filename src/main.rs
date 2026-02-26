@@ -16,6 +16,7 @@ mod tools;
 mod http;
 mod telegram;
 mod curator;
+mod cron_store;
 
 use config::AppConfig;
 use runtime::{AgentRuntime, RuntimeEvent};
@@ -42,6 +43,7 @@ async fn main() -> Result<()> {
     println!("Config: {}", rt.cfg.conf_file.display());
     println!("Transcripts: {}", rt.cfg.transcripts_file.display());
     println!("Memory index: {}", rt.cfg.memory_index_file.display());
+    println!("Cron DB: {}", rt.cfg.cron_db_file.display());
     println!(
         "Debug: {} (OXICLAW_DEBUG=1 pour activer)",
         if debug_enabled { "ON" } else { "OFF" }
