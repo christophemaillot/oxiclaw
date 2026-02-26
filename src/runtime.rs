@@ -5,6 +5,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
+use serde_json::Value;
 
 use crate::config::AppConfig;
 use crate::cron_store::{CronJobInput, CronStore};
@@ -29,6 +30,9 @@ enum SupervisorEvent {
     CuratorTickOk(String),
     CuratorTickErr(String),
     CuratorStopped,
+    CronStarted,
+    CronRunOk(String),
+    CronRunErr(String),
 }
 
 pub struct AgentRuntime {
@@ -40,6 +44,7 @@ pub struct AgentRuntime {
     supervisor_tx: mpsc::Sender<SupervisorEvent>,
     supervisor_rx: mpsc::Receiver<SupervisorEvent>,
     curator_task: Option<JoinHandle<()>>,
+    cron_task: Option<JoinHandle<()>>,
 }
 
 impl AgentRuntime {
@@ -72,6 +77,15 @@ impl AgentRuntime {
         info!("runtime:cron_db={}", cron_store.db_path().display());
         let (supervisor_tx, supervisor_rx) = mpsc::channel(256);
 
+        let cron_task = Some(Self::spawn_cron_worker(
+            cron_store.clone(),
+            cfg.basedir.clone(),
+            cfg.endpoint.clone(),
+            cfg.model.clone(),
+            cfg.api_key.clone(),
+            supervisor_tx.clone(),
+        ));
+
         Ok(Self {
             cfg,
             engine,
@@ -81,6 +95,7 @@ impl AgentRuntime {
             supervisor_tx,
             supervisor_rx,
             curator_task: None,
+            cron_task,
         })
     }
 
@@ -95,6 +110,7 @@ impl AgentRuntime {
             "/workers         -> état des workers",
             "/cron status     -> statut cron sqlite",
             "/cron add-curator-nightly -> ajoute un job systemEvent 'curate' nocturne",
+            "/cron add-notify <texte> -> ajoute un job notify one-shot (at=now)",
             "/cron list       -> liste des jobs cron",
             "/cron run <job_id> -> queue une exécution manuelle",
             "/cron runs <job_id> -> historique des runs",
@@ -164,6 +180,49 @@ impl AgentRuntime {
         }
     }
 
+    fn spawn_cron_worker(
+        cron_store: CronStore,
+        basedir: std::path::PathBuf,
+        endpoint: String,
+        model: String,
+        api_key: String,
+        tx: mpsc::Sender<SupervisorEvent>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let _ = tx.send(SupervisorEvent::CronStarted).await;
+            loop {
+                match cron_store.claim_next_queued_run() {
+                    Ok(Some(run)) => {
+                        let result = execute_system_run(&run.payload_kind, &run.payload_json, &basedir, &endpoint, &model, &api_key).await;
+                        match result {
+                            Ok(output) => {
+                                let _ = cron_store.finish_run_success(&run.run_id, &output);
+                                let _ = tx
+                                    .send(SupervisorEvent::CronRunOk(format!("job={} run={} ok", run.job_id, run.run_id)))
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = cron_store.finish_run_failed(&run.run_id, &e.to_string());
+                                let _ = tx
+                                    .send(SupervisorEvent::CronRunErr(format!("job={} run={} err={}", run.job_id, run.run_id, e)))
+                                    .await;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        sleep(Duration::from_secs(5)).await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(SupervisorEvent::CronRunErr(format!("store error: {e}")))
+                            .await;
+                        sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        })
+    }
+
     fn start_curator_worker(&mut self) -> String {
         if self.curator_task.is_some() {
             return "curator-worker: déjà démarré".to_string();
@@ -221,8 +280,9 @@ impl AgentRuntime {
         } else {
             "stopped"
         };
+        let cron = if self.cron_task.is_some() { "running" } else { "stopped" };
         format!(
-            "workers:\n- curator: {curator}\ncron:\n- db: {}",
+            "workers:\n- curator: {curator}\n- cron: {cron}\ncron:\n- db: {}",
             self.cron_store.db_path().display()
         )
     }
@@ -277,6 +337,39 @@ impl AgentRuntime {
                     Err(e) => format!("cron add: erreur: {e}"),
                 }
             }
+            Some("add-notify") => {
+                let text = parts.collect::<Vec<_>>().join(" ");
+                if text.trim().is_empty() {
+                    return "usage: /cron add-notify <texte>".to_string();
+                }
+
+                let payload = json!({
+                    "type":"notify",
+                    "version":1,
+                    "data":{"message": text}
+                })
+                .to_string();
+                let now = chrono::Utc::now().to_rfc3339();
+                let schedule = json!({"kind":"at","at": now}).to_string();
+
+                let input = CronJobInput {
+                    name: Some("notify-once".to_string()),
+                    schedule_kind: "at".to_string(),
+                    schedule_json: schedule,
+                    payload_kind: "systemEvent".to_string(),
+                    payload_json: payload,
+                    session_target: "main".to_string(),
+                    next_run_at: Some(now),
+                };
+
+                match self.cron_store.add_job(input) {
+                    Ok(job_id) => match self.cron_store.trigger_run_manual(&job_id) {
+                        Ok(run_id) => format!("cron add-notify: ok\n- job_id: {job_id}\n- run_id: {run_id}"),
+                        Err(e) => format!("cron add-notify: job créé mais run ko: {e}"),
+                    },
+                    Err(e) => format!("cron add-notify: erreur: {e}"),
+                }
+            }
             Some("run") => {
                 let Some(job_id) = parts.next() else {
                     return "usage: /cron run <job_id>".to_string();
@@ -305,7 +398,7 @@ impl AgentRuntime {
                     Err(e) => format!("cron runs: erreur: {e}"),
                 }
             }
-            _ => "usage: /cron status|list|add-curator-nightly|run <job_id>|runs <job_id>".to_string(),
+            _ => "usage: /cron status|list|add-curator-nightly|add-notify <texte>|run <job_id>|runs <job_id>".to_string(),
         }
     }
 
@@ -316,8 +409,52 @@ impl AgentRuntime {
                 SupervisorEvent::CuratorTickOk(msg) => format!("[worker] curator ok: {msg}"),
                 SupervisorEvent::CuratorTickErr(err) => format!("[worker] curator error: {err}"),
                 SupervisorEvent::CuratorStopped => "[worker] curator stopped".to_string(),
+                SupervisorEvent::CronStarted => "[worker] cron started".to_string(),
+                SupervisorEvent::CronRunOk(msg) => format!("[worker] cron ok: {msg}"),
+                SupervisorEvent::CronRunErr(err) => format!("[worker] cron error: {err}"),
             };
             let _ = self.transcripts.append(self.session.session_id(), "system", &line);
         }
+    }
+}
+
+async fn execute_system_run(
+    payload_kind: &str,
+    payload_json: &str,
+    basedir: &std::path::Path,
+    endpoint: &str,
+    model: &str,
+    api_key: &str,
+) -> Result<String> {
+    if payload_kind != "systemEvent" {
+        anyhow::bail!("payload non supporté par le moteur v1: {payload_kind}");
+    }
+
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let event_type = payload
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    match event_type {
+        "curate" => {
+            let msg = curator::run_manual(
+                &basedir.to_path_buf(),
+                endpoint,
+                model,
+                api_key,
+            )
+            .await?;
+            Ok(json!({"event":"curate","ok":true,"message":msg}).to_string())
+        }
+        "notify" => {
+            let message = payload
+                .get("data")
+                .and_then(|d| d.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("notification");
+            Ok(json!({"event":"notify","ok":true,"message":message}).to_string())
+        }
+        other => anyhow::bail!("systemEvent non supporté: {other}"),
     }
 }

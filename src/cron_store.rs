@@ -42,6 +42,14 @@ pub struct CronRunRow {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct QueuedRun {
+    pub run_id: String,
+    pub job_id: String,
+    pub payload_kind: String,
+    pub payload_json: String,
+}
+
 impl CronStore {
     pub fn init(db_path: impl AsRef<Path>) -> Result<Self> {
         let db_path = db_path.as_ref().to_path_buf();
@@ -212,6 +220,74 @@ impl CronStore {
         })?;
 
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn claim_next_queued_run(&self) -> Result<Option<QueuedRun>> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
+
+        let picked: Option<QueuedRun> = {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT r.run_id, r.job_id, j.payload_kind, j.payload_json
+                FROM cron_job_runs r
+                JOIN cron_jobs j ON j.id = r.job_id
+                WHERE r.status = 'queued'
+                ORDER BY r.created_at ASC
+                LIMIT 1
+                "#,
+            )?;
+
+            let mut rows = stmt.query([])?;
+            if let Some(row) = rows.next()? {
+                Some(QueuedRun {
+                    run_id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    payload_kind: row.get(2)?,
+                    payload_json: row.get(3)?,
+                })
+            } else {
+                None
+            }
+        };
+
+        if let Some(run) = &picked {
+            conn.execute(
+                "UPDATE cron_job_runs SET status='running', started_at=?2 WHERE run_id=?1",
+                params![run.run_id, Utc::now().to_rfc3339()],
+            )?;
+            conn.execute_batch("COMMIT;")?;
+            return Ok(Some(run.clone()));
+        }
+
+        conn.execute_batch("COMMIT;")?;
+        Ok(None)
+    }
+
+    pub fn finish_run_success(&self, run_id: &str, output_json: &str) -> Result<()> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.execute(
+            r#"
+            UPDATE cron_job_runs
+            SET status='succeeded', finished_at=?2, output_json=?3
+            WHERE run_id=?1
+            "#,
+            params![run_id, Utc::now().to_rfc3339(), output_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_run_failed(&self, run_id: &str, error_text: &str) -> Result<()> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.execute(
+            r#"
+            UPDATE cron_job_runs
+            SET status='failed', finished_at=?2, error_text=?3
+            WHERE run_id=?1
+            "#,
+            params![run_id, Utc::now().to_rfc3339(), error_text],
+        )?;
+        Ok(())
     }
 }
 
