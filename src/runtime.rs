@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::Utc;
 use std::env;
 use log::{info, warn};
 use serde_json::json;
@@ -191,6 +192,12 @@ impl AgentRuntime {
         tokio::spawn(async move {
             let _ = tx.send(SupervisorEvent::CronStarted).await;
             loop {
+                if let Err(e) = cron_store.enqueue_due_jobs(Utc::now()) {
+                    let _ = tx
+                        .send(SupervisorEvent::CronRunErr(format!("enqueue error: {e}")))
+                        .await;
+                }
+
                 match cron_store.claim_next_queued_run() {
                     Ok(Some(run)) => {
                         let result = execute_system_run(&run.payload_kind, &run.payload_json, &basedir, &endpoint, &model, &api_key).await;

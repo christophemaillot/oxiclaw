@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Result};
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use cron::Schedule;
 use rusqlite::{params, Connection};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -117,6 +119,11 @@ impl CronStore {
 
         let conn = Connection::open(&self.db_path)?;
         let id = Uuid::new_v4().to_string();
+        let initial_next_run = if let Some(v) = input.next_run_at.clone() {
+            Some(v)
+        } else {
+            compute_next_run_at(&input.schedule_kind, &input.schedule_json, Utc::now())?
+        };
 
         conn.execute(
             r#"
@@ -134,7 +141,7 @@ impl CronStore {
                 input.payload_kind,
                 input.payload_json,
                 input.session_target,
-                input.next_run_at,
+                initial_next_run,
             ],
         )?;
 
@@ -222,6 +229,68 @@ impl CronStore {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    pub fn enqueue_due_jobs(&self, now: DateTime<Utc>) -> Result<usize> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, schedule_kind, schedule_json
+            FROM cron_jobs
+            WHERE enabled = 1
+              AND next_run_at IS NOT NULL
+              AND next_run_at <= ?1
+            ORDER BY next_run_at ASC
+            "#,
+        )?;
+
+        let due_rows = stmt
+            .query_map(params![now.to_rfc3339()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut enqueued = 0usize;
+        for (job_id, schedule_kind, schedule_json) in due_rows {
+            let active_runs: i64 = conn.query_row(
+                "SELECT COUNT(1) FROM cron_job_runs WHERE job_id=?1 AND status IN ('queued','running')",
+                params![job_id],
+                |r| r.get(0),
+            )?;
+            if active_runs > 0 {
+                continue;
+            }
+
+            let run_id = Uuid::new_v4().to_string();
+            conn.execute(
+                r#"
+                INSERT INTO cron_job_runs(run_id, job_id, status, trigger_source, output_json)
+                VALUES (?1, ?2, 'queued', 'schedule', ?3)
+                "#,
+                params![run_id, job_id, json!({"note":"auto queued by scheduler"}).to_string()],
+            )?;
+
+            let next = compute_next_run_at(&schedule_kind, &schedule_json, now)?;
+            let enabled = if next.is_some() { 1 } else { 0 };
+            conn.execute(
+                r#"
+                UPDATE cron_jobs
+                SET last_run_at=?2, next_run_at=?3, enabled=?4, updated_at=(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                WHERE id=?1
+                "#,
+                params![job_id, now.to_rfc3339(), next, enabled],
+            )?;
+            enqueued += 1;
+        }
+
+        conn.execute_batch("COMMIT;")?;
+        Ok(enqueued)
+    }
+
     pub fn claim_next_queued_run(&self) -> Result<Option<QueuedRun>> {
         let conn = Connection::open(&self.db_path)?;
         conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
@@ -288,6 +357,40 @@ impl CronStore {
             params![run_id, Utc::now().to_rfc3339(), error_text],
         )?;
         Ok(())
+    }
+}
+
+fn compute_next_run_at(
+    schedule_kind: &str,
+    schedule_json: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<String>> {
+    let schedule: Value = serde_json::from_str(schedule_json)?;
+
+    match schedule_kind {
+        "at" => Ok(None),
+        "every" => {
+            let every_ms = schedule
+                .get("everyMs")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow!("every schedule invalide: everyMs manquant"))?;
+            if every_ms <= 0 {
+                return Err(anyhow!("every schedule invalide: everyMs <= 0"));
+            }
+            let next = now + ChronoDuration::milliseconds(every_ms);
+            Ok(Some(next.to_rfc3339()))
+        }
+        "cron" => {
+            let expr = schedule
+                .get("expr")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("cron schedule invalide: expr manquant"))?;
+            let sched = Schedule::from_str(expr)
+                .map_err(|e| anyhow!("cron expr invalide '{expr}': {e}"))?;
+            let mut upcoming = sched.after(&now);
+            Ok(upcoming.next().map(|dt| dt.to_rfc3339()))
+        }
+        other => Err(anyhow!("schedule_kind inconnu: {other}")),
     }
 }
 
