@@ -254,6 +254,13 @@ Contraintes: max __MAX_ADDITIONS__ lignes par tableau, lignes courtes et concrè
         r#"Template futur pour le prompt des runs cron (à brancher quand le scheduler interne sera en place)."#,
     )?;
 
+    ensure_file(
+        &basedir.join("conf").join("prompts").join("tools.toml"),
+        r#"[tools.cron_manage]
+description = "Gestion cron limitée. Pour action=add_agent_turn, le champ 'message' doit être une INSTRUCTION exécutable par un sous-agent (objectif + actions attendues), pas un texte d'annonce à l'utilisateur."
+"#,
+    )?;
+
     Ok(())
 }
 

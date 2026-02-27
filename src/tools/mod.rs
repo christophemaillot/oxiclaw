@@ -13,8 +13,8 @@ use crate::memory;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub description: String,
     pub args_schema: Value,
 }
 
@@ -27,8 +27,8 @@ pub struct TimeTool;
 impl Tool for TimeTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "time",
-            description: "Retourne l'heure courante en UTC (RFC3339)",
+            name: "time".to_string(),
+            description: "Retourne l'heure courante en UTC (RFC3339)".to_string(),
             args_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -46,8 +46,8 @@ pub struct EchoTool;
 impl Tool for EchoTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "echo",
-            description: "Répète exactement le texte fourni",
+            name: "echo".to_string(),
+            description: "Répète exactement le texte fourni".to_string(),
             args_schema: json!({
                 "type": "object",
                 "properties": {
@@ -72,8 +72,8 @@ pub struct HttpRequestTool;
 impl Tool for HttpRequestTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "http_request",
-            description: "Exécute une requête HTTP (GET/POST/PUT/PATCH/DELETE...) avec timeout, headers et payload JSON/texte.",
+            name: "http_request".to_string(),
+            description: "Exécute une requête HTTP (GET/POST/PUT/PATCH/DELETE...) avec timeout, headers et payload JSON/texte.".to_string(),
             args_schema: json!({
                 "type": "object",
                 "properties": {
@@ -204,8 +204,8 @@ impl InfoAppendTool {
 impl Tool for InfoAppendTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "info_append",
-            description: "Ajoute une note append-only dans AGENT.md ou USER.md. SOUL.md est interdit.",
+            name: "info_append".to_string(),
+            description: "Ajoute une note append-only dans AGENT.md ou USER.md. SOUL.md est interdit.".to_string(),
             args_schema: json!({
                 "type": "object",
                 "properties": {
@@ -289,8 +289,8 @@ impl MemoryGetTool {
 impl Tool for MemorySearchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "memory_search",
-            description: "Cherche des souvenirs pertinents dans les index mémoire construits depuis les transcripts",
+            name: "memory_search".to_string(),
+            description: "Cherche des souvenirs pertinents dans les index mémoire construits depuis les transcripts".to_string(),
             args_schema: json!({
                 "type": "object",
                 "properties": {
@@ -337,8 +337,8 @@ impl Tool for MemorySearchTool {
 impl Tool for MemoryGetTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "memory_get",
-            description: "Lit un souvenir précis à partir de son identifiant renvoyé par memory_search",
+            name: "memory_get".to_string(),
+            description: "Lit un souvenir précis à partir de son identifiant renvoyé par memory_search".to_string(),
             args_schema: json!({
                 "type": "object",
                 "properties": {
@@ -377,8 +377,8 @@ impl CronManageTool {
 impl Tool for CronManageTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "cron_manage",
-            description: "Gestion cron limitée: add_notify, add_agent_turn, list, runs, run",
+            name: "cron_manage".to_string(),
+            description: "Gestion cron limitée: add_notify, add_agent_turn, list, runs, run".to_string(),
             args_schema: json!({
                 "type": "object",
                 "properties": {
@@ -535,13 +535,16 @@ impl Tool for CronManageTool {
 }
 
 pub struct ToolRegistry {
-    tools: HashMap<&'static str, Box<dyn Tool>>,
+    tools: HashMap<String, Box<dyn Tool>>,
+    descriptions: HashMap<String, String>,
 }
 
 impl ToolRegistry {
     pub fn with_defaults(basedir: PathBuf) -> Self {
+        let descriptions = load_tool_descriptions(&basedir);
         let mut registry = Self {
             tools: HashMap::new(),
+            descriptions,
         };
         registry.register(Box::new(TimeTool));
         registry.register(Box::new(EchoTool));
@@ -566,7 +569,16 @@ impl ToolRegistry {
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.values().map(|t| t.spec()).collect()
+        self.tools
+            .values()
+            .map(|t| {
+                let mut spec = t.spec();
+                if let Some(desc) = self.descriptions.get(&spec.name) {
+                    spec.description = desc.clone();
+                }
+                spec
+            })
+            .collect()
     }
 
     pub fn specs_json_pretty(&self) -> String {
@@ -627,4 +639,26 @@ pub fn escape_for_json_string(input: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
+}
+
+fn load_tool_descriptions(basedir: &PathBuf) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let path = basedir.join("conf").join("prompts").join("tools.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return out;
+    };
+    let Ok(v) = raw.parse::<toml::Value>() else {
+        return out;
+    };
+    let Some(tools) = v.get("tools").and_then(|t| t.as_table()) else {
+        return out;
+    };
+
+    for (name, node) in tools {
+        if let Some(desc) = node.get("description").and_then(|d| d.as_str()) {
+            out.insert(name.to_string(), desc.to_string());
+        }
+    }
+
+    out
 }
