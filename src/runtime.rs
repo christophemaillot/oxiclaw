@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use std::env;
 use log::{info, warn};
+use reqwest::Client;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -85,6 +86,8 @@ impl AgentRuntime {
             cfg.endpoint.clone(),
             cfg.model.clone(),
             cfg.api_key.clone(),
+            cfg.telegram_bot_token.clone(),
+            cfg.telegram_default_chat_id.clone(),
             supervisor_tx.clone(),
         ));
 
@@ -188,6 +191,8 @@ impl AgentRuntime {
         endpoint: String,
         model: String,
         api_key: String,
+        telegram_bot_token: Option<String>,
+        telegram_default_chat_id: Option<String>,
         tx: mpsc::Sender<SupervisorEvent>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
@@ -206,6 +211,18 @@ impl AgentRuntime {
                             Ok(output) => {
                                 let _ = cron_store.finish_run_success(&run.run_id, &output.output_json);
                                 if let Some(msg) = output.notify_main {
+                                    if let (Some(token), Some(chat_id_raw)) = (
+                                        telegram_bot_token.as_deref(),
+                                        telegram_default_chat_id.as_deref(),
+                                    ) {
+                                        if let Ok(chat_id) = chat_id_raw.trim().parse::<i64>() {
+                                            if let Err(e) = send_telegram_notify(token, chat_id, &msg).await {
+                                                let _ = tx
+                                                    .send(SupervisorEvent::CronRunErr(format!("notify telegram error: {e}")))
+                                                    .await;
+                                            }
+                                        }
+                                    }
                                     let _ = tx.send(SupervisorEvent::CronNotify(msg)).await;
                                 }
                                 let _ = tx
@@ -432,6 +449,18 @@ impl AgentRuntime {
             let _ = self.transcripts.append(self.session.session_id(), "system", &line);
         }
     }
+}
+
+async fn send_telegram_notify(bot_token: &str, chat_id: i64, text: &str) -> Result<()> {
+    let client = Client::new();
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
+    client
+        .post(url)
+        .json(&json!({"chat_id": chat_id, "text": text}))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
 }
 
 struct SystemRunOutput {

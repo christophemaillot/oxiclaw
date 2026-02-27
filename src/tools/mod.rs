@@ -364,137 +364,132 @@ impl Tool for MemoryGetTool {
     }
 }
 
-pub struct CronNotifyTestTool {
+pub struct CronManageTool {
     basedir: PathBuf,
 }
 
-impl CronNotifyTestTool {
+impl CronManageTool {
     pub fn new(basedir: PathBuf) -> Self {
         Self { basedir }
     }
 }
 
-pub struct CronListTool {
-    basedir: PathBuf,
-}
-
-impl CronListTool {
-    pub fn new(basedir: PathBuf) -> Self {
-        Self { basedir }
-    }
-}
-
-impl Tool for CronNotifyTestTool {
+impl Tool for CronManageTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "cron_notify_test",
-            description: "Programme une notification système de test via le moteur cron interne",
+            name: "cron_manage",
+            description: "Gestion cron limitée: add_notify, list, runs, run",
             args_schema: json!({
                 "type": "object",
                 "properties": {
-                    "message": {"type": "string", "description": "Texte de notification"},
-                    "delay_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Délai avant envoi (défaut: 10s)"}
+                    "action": {"type": "string", "enum": ["add_notify", "list", "runs", "run"]},
+                    "message": {"type": "string", "description": "Texte de notif pour add_notify"},
+                    "delay_seconds": {"type": "integer", "minimum": 1, "maximum": 86400, "description": "Délai pour add_notify (défaut 60s)"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Nombre max de lignes pour list/runs"},
+                    "job_id": {"type": "string", "description": "ID du job pour runs/run"}
                 },
-                "required": ["message"],
+                "required": ["action"],
                 "additionalProperties": false
             }),
         }
     }
 
     fn run(&self, args: &Value) -> String {
-        let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("").trim();
-        if message.is_empty() {
-            return "erreur cron_notify_test: message vide".to_string();
-        }
-
-        let delay_seconds = args
-            .get("delay_seconds")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(10)
-            .clamp(1, 3600);
-
-        let run_at = Utc::now() + ChronoDuration::seconds(delay_seconds);
-        let payload = json!({
-            "type":"notify",
-            "version":1,
-            "data":{"message": message}
-        })
-        .to_string();
-        let schedule = json!({"kind":"at","at": run_at.to_rfc3339()}).to_string();
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).clamp(1, 100) as usize;
 
         let store = match CronStore::init(self.basedir.join("state").join("cron.sqlite")) {
             Ok(s) => s,
-            Err(e) => return format!("erreur cron_notify_test: init store: {e}"),
+            Err(e) => return format!("erreur cron_manage: init store: {e}"),
         };
 
-        let input = CronJobInput {
-            name: Some("notify-test".to_string()),
-            schedule_kind: "at".to_string(),
-            schedule_json: schedule,
-            payload_kind: "systemEvent".to_string(),
-            payload_json: payload,
-            session_target: "main".to_string(),
-            next_run_at: Some(run_at.to_rfc3339()),
-        };
-
-        match store.add_job(input) {
-            Ok(job_id) => format!(
-                "cron_notify_test: job créé\n- job_id: {}\n- at: {}\n- message: {}",
-                job_id,
-                run_at.to_rfc3339(),
-                message
-            ),
-            Err(e) => format!("erreur cron_notify_test: add_job: {e}"),
-        }
-    }
-}
-
-impl Tool for CronListTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "cron_list",
-            description: "Liste les jobs cron connus dans la base locale",
-            args_schema: json!({
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Nombre max de jobs (défaut: 20)"}
-                },
-                "additionalProperties": false
-            }),
-        }
-    }
-
-    fn run(&self, args: &Value) -> String {
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(20)
-            .clamp(1, 100) as usize;
-
-        let store = match CronStore::init(self.basedir.join("state").join("cron.sqlite")) {
-            Ok(s) => s,
-            Err(e) => return format!("erreur cron_list: init store: {e}"),
-        };
-
-        match store.list_jobs(limit) {
-            Ok(rows) if rows.is_empty() => "cron_list: aucun job".to_string(),
-            Ok(rows) => {
-                let mut out = vec![format!("cron_list: {} job(s)", rows.len())];
-                for j in rows {
-                    out.push(format!(
-                        "- {} | {} | schedule={} | payload={} | target={} | enabled={} | next={}",
-                        j.id,
-                        j.name.unwrap_or_else(|| "(sans nom)".to_string()),
-                        j.schedule_kind,
-                        j.payload_kind,
-                        j.session_target,
-                        j.enabled,
-                        j.next_run_at.unwrap_or_else(|| "-".to_string())
-                    ));
+        match action {
+            "add_notify" => {
+                let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if message.is_empty() {
+                    return "erreur cron_manage.add_notify: message vide".to_string();
                 }
-                out.join("\n")
+                let delay_seconds = args
+                    .get("delay_seconds")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(60)
+                    .clamp(1, 86400);
+                let run_at = Utc::now() + ChronoDuration::seconds(delay_seconds);
+
+                let payload = json!({
+                    "type":"notify",
+                    "version":1,
+                    "data":{"message": message}
+                })
+                .to_string();
+                let schedule = json!({"kind":"at","at": run_at.to_rfc3339()}).to_string();
+
+                let input = CronJobInput {
+                    name: Some("notify-test".to_string()),
+                    schedule_kind: "at".to_string(),
+                    schedule_json: schedule,
+                    payload_kind: "systemEvent".to_string(),
+                    payload_json: payload,
+                    session_target: "main".to_string(),
+                    next_run_at: Some(run_at.to_rfc3339()),
+                };
+
+                match store.add_job(input) {
+                    Ok(job_id) => format!(
+                        "cron_manage.add_notify: ok\n- job_id: {}\n- at: {}\n- message: {}",
+                        job_id,
+                        run_at.to_rfc3339(),
+                        message
+                    ),
+                    Err(e) => format!("erreur cron_manage.add_notify: {e}"),
+                }
             }
-            Err(e) => format!("erreur cron_list: {e}"),
+            "list" => match store.list_jobs(limit) {
+                Ok(rows) if rows.is_empty() => "cron_manage.list: aucun job".to_string(),
+                Ok(rows) => {
+                    let mut out = vec![format!("cron_manage.list: {} job(s)", rows.len())];
+                    for j in rows {
+                        out.push(format!(
+                            "- {} | {} | schedule={} | payload={} | target={} | enabled={} | next={}",
+                            j.id,
+                            j.name.unwrap_or_else(|| "(sans nom)".to_string()),
+                            j.schedule_kind,
+                            j.payload_kind,
+                            j.session_target,
+                            j.enabled,
+                            j.next_run_at.unwrap_or_else(|| "-".to_string())
+                        ));
+                    }
+                    out.join("\n")
+                }
+                Err(e) => format!("erreur cron_manage.list: {e}"),
+            },
+            "runs" => {
+                let Some(job_id) = args.get("job_id").and_then(|v| v.as_str()) else {
+                    return "erreur cron_manage.runs: job_id requis".to_string();
+                };
+                match store.list_runs(job_id, limit) {
+                    Ok(rows) if rows.is_empty() => format!("cron_manage.runs: aucun run pour {job_id}"),
+                    Ok(rows) => {
+                        let mut out = vec![format!("cron_manage.runs: {}", job_id)];
+                        for r in rows {
+                            out.push(format!("- {} | status={} | trigger={} | at={}", r.run_id, r.status, r.trigger_source, r.created_at));
+                        }
+                        out.join("\n")
+                    }
+                    Err(e) => format!("erreur cron_manage.runs: {e}"),
+                }
+            }
+            "run" => {
+                let Some(job_id) = args.get("job_id").and_then(|v| v.as_str()) else {
+                    return "erreur cron_manage.run: job_id requis".to_string();
+                };
+                match store.trigger_run_manual(job_id) {
+                    Ok(run_id) => format!("cron_manage.run: queued\n- job_id: {}\n- run_id: {}", job_id, run_id),
+                    Err(e) => format!("erreur cron_manage.run: {e}"),
+                }
+            }
+            _ => "erreur cron_manage: action invalide (add_notify|list|runs|run)".to_string(),
         }
     }
 }
@@ -514,8 +509,7 @@ impl ToolRegistry {
         registry.register(Box::new(InfoAppendTool::new(basedir.clone())));
         registry.register(Box::new(MemorySearchTool::new(basedir.clone())));
         registry.register(Box::new(MemoryGetTool::new(basedir.clone())));
-        registry.register(Box::new(CronNotifyTestTool::new(basedir.clone())));
-        registry.register(Box::new(CronListTool::new(basedir)));
+        registry.register(Box::new(CronManageTool::new(basedir)));
         registry
     }
 
