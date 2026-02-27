@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use ureq;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -8,6 +8,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::cron_store::{CronJobInput, CronStore};
 use crate::memory;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,6 +364,81 @@ impl Tool for MemoryGetTool {
     }
 }
 
+pub struct CronNotifyTestTool {
+    basedir: PathBuf,
+}
+
+impl CronNotifyTestTool {
+    pub fn new(basedir: PathBuf) -> Self {
+        Self { basedir }
+    }
+}
+
+impl Tool for CronNotifyTestTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "cron_notify_test",
+            description: "Programme une notification système de test via le moteur cron interne",
+            args_schema: json!({
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Texte de notification"},
+                    "delay_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Délai avant envoi (défaut: 10s)"}
+                },
+                "required": ["message"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn run(&self, args: &Value) -> String {
+        let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if message.is_empty() {
+            return "erreur cron_notify_test: message vide".to_string();
+        }
+
+        let delay_seconds = args
+            .get("delay_seconds")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(10)
+            .clamp(1, 3600);
+
+        let run_at = Utc::now() + ChronoDuration::seconds(delay_seconds);
+        let payload = json!({
+            "type":"notify",
+            "version":1,
+            "data":{"message": message}
+        })
+        .to_string();
+        let schedule = json!({"kind":"at","at": run_at.to_rfc3339()}).to_string();
+
+        let store = match CronStore::init(self.basedir.join("state").join("cron.sqlite")) {
+            Ok(s) => s,
+            Err(e) => return format!("erreur cron_notify_test: init store: {e}"),
+        };
+
+        let input = CronJobInput {
+            name: Some("notify-test".to_string()),
+            schedule_kind: "at".to_string(),
+            schedule_json: schedule,
+            payload_kind: "systemEvent".to_string(),
+            payload_json: payload,
+            session_target: "main".to_string(),
+            next_run_at: Some(run_at.to_rfc3339()),
+        };
+
+        match store.add_job(input) {
+            Ok(job_id) => format!(
+                "cron_notify_test: job créé\n- job_id: {}\n- at: {}\n- message: {}",
+                job_id,
+                run_at.to_rfc3339(),
+                message
+            ),
+            Err(e) => format!("erreur cron_notify_test: add_job: {e}"),
+        }
+    }
+}
+
 pub struct ToolRegistry {
     tools: HashMap<&'static str, Box<dyn Tool>>,
 }
@@ -377,7 +453,8 @@ impl ToolRegistry {
         registry.register(Box::new(HttpRequestTool));
         registry.register(Box::new(InfoAppendTool::new(basedir.clone())));
         registry.register(Box::new(MemorySearchTool::new(basedir.clone())));
-        registry.register(Box::new(MemoryGetTool::new(basedir)));
+        registry.register(Box::new(MemoryGetTool::new(basedir.clone())));
+        registry.register(Box::new(CronNotifyTestTool::new(basedir)));
         registry
     }
 
