@@ -34,6 +34,7 @@ enum SupervisorEvent {
     CronStarted,
     CronRunOk(String),
     CronRunErr(String),
+    CronNotify(String),
 }
 
 pub struct AgentRuntime {
@@ -203,7 +204,10 @@ impl AgentRuntime {
                         let result = execute_system_run(&run.payload_kind, &run.payload_json, &basedir, &endpoint, &model, &api_key).await;
                         match result {
                             Ok(output) => {
-                                let _ = cron_store.finish_run_success(&run.run_id, &output);
+                                let _ = cron_store.finish_run_success(&run.run_id, &output.output_json);
+                                if let Some(msg) = output.notify_main {
+                                    let _ = tx.send(SupervisorEvent::CronNotify(msg)).await;
+                                }
                                 let _ = tx
                                     .send(SupervisorEvent::CronRunOk(format!("job={} run={} ok", run.job_id, run.run_id)))
                                     .await;
@@ -419,10 +423,20 @@ impl AgentRuntime {
                 SupervisorEvent::CronStarted => "[worker] cron started".to_string(),
                 SupervisorEvent::CronRunOk(msg) => format!("[worker] cron ok: {msg}"),
                 SupervisorEvent::CronRunErr(err) => format!("[worker] cron error: {err}"),
+                SupervisorEvent::CronNotify(msg) => {
+                    let notify_line = format!("[cron notify] {msg}");
+                    self.session.push_system(notify_line.clone());
+                    notify_line
+                }
             };
             let _ = self.transcripts.append(self.session.session_id(), "system", &line);
         }
     }
+}
+
+struct SystemRunOutput {
+    output_json: String,
+    notify_main: Option<String>,
 }
 
 async fn execute_system_run(
@@ -432,7 +446,7 @@ async fn execute_system_run(
     endpoint: &str,
     model: &str,
     api_key: &str,
-) -> Result<String> {
+) -> Result<SystemRunOutput> {
     if payload_kind != "systemEvent" {
         anyhow::bail!("payload non supporté par le moteur v1: {payload_kind}");
     }
@@ -452,7 +466,10 @@ async fn execute_system_run(
                 api_key,
             )
             .await?;
-            Ok(json!({"event":"curate","ok":true,"message":msg}).to_string())
+            Ok(SystemRunOutput {
+                output_json: json!({"event":"curate","ok":true,"message":msg}).to_string(),
+                notify_main: None,
+            })
         }
         "notify" => {
             let message = payload
@@ -460,7 +477,10 @@ async fn execute_system_run(
                 .and_then(|d| d.get("message"))
                 .and_then(|m| m.as_str())
                 .unwrap_or("notification");
-            Ok(json!({"event":"notify","ok":true,"message":message}).to_string())
+            Ok(SystemRunOutput {
+                output_json: json!({"event":"notify","ok":true,"message":message}).to_string(),
+                notify_main: Some(message.to_string()),
+            })
         }
         other => anyhow::bail!("systemEvent non supporté: {other}"),
     }
