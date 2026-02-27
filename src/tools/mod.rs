@@ -374,6 +374,16 @@ impl CronNotifyTestTool {
     }
 }
 
+pub struct CronListTool {
+    basedir: PathBuf,
+}
+
+impl CronListTool {
+    pub fn new(basedir: PathBuf) -> Self {
+        Self { basedir }
+    }
+}
+
 impl Tool for CronNotifyTestTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
@@ -439,6 +449,56 @@ impl Tool for CronNotifyTestTool {
     }
 }
 
+impl Tool for CronListTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "cron_list",
+            description: "Liste les jobs cron connus dans la base locale",
+            args_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Nombre max de jobs (défaut: 20)"}
+                },
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn run(&self, args: &Value) -> String {
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .clamp(1, 100) as usize;
+
+        let store = match CronStore::init(self.basedir.join("state").join("cron.sqlite")) {
+            Ok(s) => s,
+            Err(e) => return format!("erreur cron_list: init store: {e}"),
+        };
+
+        match store.list_jobs(limit) {
+            Ok(rows) if rows.is_empty() => "cron_list: aucun job".to_string(),
+            Ok(rows) => {
+                let mut out = vec![format!("cron_list: {} job(s)", rows.len())];
+                for j in rows {
+                    out.push(format!(
+                        "- {} | {} | schedule={} | payload={} | target={} | enabled={} | next={}",
+                        j.id,
+                        j.name.unwrap_or_else(|| "(sans nom)".to_string()),
+                        j.schedule_kind,
+                        j.payload_kind,
+                        j.session_target,
+                        j.enabled,
+                        j.next_run_at.unwrap_or_else(|| "-".to_string())
+                    ));
+                }
+                out.join("\n")
+            }
+            Err(e) => format!("erreur cron_list: {e}"),
+        }
+    }
+}
+
 pub struct ToolRegistry {
     tools: HashMap<&'static str, Box<dyn Tool>>,
 }
@@ -454,7 +514,8 @@ impl ToolRegistry {
         registry.register(Box::new(InfoAppendTool::new(basedir.clone())));
         registry.register(Box::new(MemorySearchTool::new(basedir.clone())));
         registry.register(Box::new(MemoryGetTool::new(basedir.clone())));
-        registry.register(Box::new(CronNotifyTestTool::new(basedir)));
+        registry.register(Box::new(CronNotifyTestTool::new(basedir.clone())));
+        registry.register(Box::new(CronListTool::new(basedir)));
         registry
     }
 
