@@ -14,9 +14,10 @@ use crate::cron_store::{CronJobInput, CronStore};
 use crate::curator;
 use crate::engine::Engine;
 use crate::llm::openai_compat::OpenAiCompatClient;
+use crate::llm::{LlmClient, LlmRequest};
 use crate::memory;
 use crate::persona;
-use crate::session::Session;
+use crate::session::{ChatMessage, Session};
 use crate::storage::TranscriptStore;
 use crate::tools::ToolRegistry;
 
@@ -476,41 +477,80 @@ async fn execute_system_run(
     model: &str,
     api_key: &str,
 ) -> Result<SystemRunOutput> {
-    if payload_kind != "systemEvent" {
-        anyhow::bail!("payload non supporté par le moteur v1: {payload_kind}");
-    }
+    match payload_kind {
+        "systemEvent" => {
+            let payload: Value = serde_json::from_str(payload_json)?;
+            let event_type = payload
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
 
-    let payload: Value = serde_json::from_str(payload_json)?;
-    let event_type = payload
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-
-    match event_type {
-        "curate" => {
-            let msg = curator::run_manual(
-                &basedir.to_path_buf(),
-                endpoint,
-                model,
-                api_key,
-            )
-            .await?;
-            Ok(SystemRunOutput {
-                output_json: json!({"event":"curate","ok":true,"message":msg}).to_string(),
-                notify_main: None,
-            })
+            match event_type {
+                "curate" => {
+                    let msg = curator::run_manual(
+                        &basedir.to_path_buf(),
+                        endpoint,
+                        model,
+                        api_key,
+                    )
+                    .await?;
+                    Ok(SystemRunOutput {
+                        output_json: json!({"event":"curate","ok":true,"message":msg}).to_string(),
+                        notify_main: None,
+                    })
+                }
+                "notify" => {
+                    let message = payload
+                        .get("data")
+                        .and_then(|d| d.get("message"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("notification");
+                    Ok(SystemRunOutput {
+                        output_json: json!({"event":"notify","ok":true,"message":message}).to_string(),
+                        notify_main: Some(message.to_string()),
+                    })
+                }
+                other => anyhow::bail!("systemEvent non supporté: {other}"),
+            }
         }
-        "notify" => {
+        "agentTurn" => {
+            let payload: Value = serde_json::from_str(payload_json)?;
             let message = payload
-                .get("data")
-                .and_then(|d| d.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("notification");
+                .get("message")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("agentTurn: message manquant"))?;
+            let run_model = payload
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or(model)
+                .to_string();
+
+            let client = OpenAiCompatClient::new(endpoint.to_string(), api_key.to_string());
+            let messages = vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: "Tu es un sous-agent cron. Réponds de manière concise et actionnable.".to_string(),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: message.to_string(),
+                },
+            ];
+
+            let answer = client
+                .complete(LlmRequest {
+                    model: run_model,
+                    messages,
+                    temperature: 0.2,
+                })
+                .await?;
+
+            let notify = format!("[cron agentTurn] {}", answer.chars().take(300).collect::<String>());
             Ok(SystemRunOutput {
-                output_json: json!({"event":"notify","ok":true,"message":message}).to_string(),
-                notify_main: Some(message.to_string()),
+                output_json: json!({"kind":"agentTurn","ok":true,"answer":answer}).to_string(),
+                notify_main: Some(notify),
             })
         }
-        other => anyhow::bail!("systemEvent non supporté: {other}"),
+        other => anyhow::bail!("payload_kind non supporté: {other}"),
     }
 }

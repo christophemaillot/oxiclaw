@@ -378,13 +378,14 @@ impl Tool for CronManageTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "cron_manage",
-            description: "Gestion cron limitée: add_notify, list, runs, run",
+            description: "Gestion cron limitée: add_notify, add_agent_turn, list, runs, run",
             args_schema: json!({
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["add_notify", "list", "runs", "run"]},
-                    "message": {"type": "string", "description": "Texte de notif pour add_notify"},
-                    "delay_seconds": {"type": "integer", "minimum": 1, "maximum": 86400, "description": "Délai pour add_notify (défaut 60s)"},
+                    "action": {"type": "string", "enum": ["add_notify", "add_agent_turn", "list", "runs", "run"]},
+                    "message": {"type": "string", "description": "Texte pour add_notify / prompt pour add_agent_turn"},
+                    "delay_seconds": {"type": "integer", "minimum": 1, "maximum": 86400, "description": "Délai pour add_notify/add_agent_turn (défaut 60s)"},
+                    "model": {"type": "string", "description": "Modèle optionnel pour add_agent_turn"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Nombre max de lignes pour list/runs"},
                     "job_id": {"type": "string", "description": "ID du job pour runs/run"}
                 },
@@ -444,6 +445,45 @@ impl Tool for CronManageTool {
                     Err(e) => format!("erreur cron_manage.add_notify: {e}"),
                 }
             }
+            "add_agent_turn" => {
+                let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if message.is_empty() {
+                    return "erreur cron_manage.add_agent_turn: message vide".to_string();
+                }
+                let delay_seconds = args
+                    .get("delay_seconds")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(60)
+                    .clamp(1, 86400);
+                let run_at = Utc::now() + ChronoDuration::seconds(delay_seconds);
+                let model = args.get("model").and_then(|v| v.as_str());
+
+                let mut payload = json!({"message": message});
+                if let Some(m) = model {
+                    payload["model"] = Value::String(m.to_string());
+                }
+
+                let schedule = json!({"kind":"at","at": run_at.to_rfc3339()}).to_string();
+                let input = CronJobInput {
+                    name: Some("agent-turn-test".to_string()),
+                    schedule_kind: "at".to_string(),
+                    schedule_json: schedule,
+                    payload_kind: "agentTurn".to_string(),
+                    payload_json: payload.to_string(),
+                    session_target: "isolated".to_string(),
+                    next_run_at: Some(run_at.to_rfc3339()),
+                };
+
+                match store.add_job(input) {
+                    Ok(job_id) => format!(
+                        "cron_manage.add_agent_turn: ok\n- job_id: {}\n- at: {}\n- message: {}",
+                        job_id,
+                        run_at.to_rfc3339(),
+                        message
+                    ),
+                    Err(e) => format!("erreur cron_manage.add_agent_turn: {e}"),
+                }
+            }
             "list" => match store.list_jobs(limit) {
                 Ok(rows) if rows.is_empty() => "cron_manage.list: aucun job".to_string(),
                 Ok(rows) => {
@@ -489,7 +529,7 @@ impl Tool for CronManageTool {
                     Err(e) => format!("erreur cron_manage.run: {e}"),
                 }
             }
-            _ => "erreur cron_manage: action invalide (add_notify|list|runs|run)".to_string(),
+            _ => "erreur cron_manage: action invalide (add_notify|add_agent_turn|list|runs|run)".to_string(),
         }
     }
 }
