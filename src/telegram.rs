@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -57,10 +57,19 @@ pub async fn serve(runtime: AgentRuntime) -> Result<()> {
     let mut offset: i64 = 0;
 
     loop {
-        let updates = get_updates(&client, &base, offset).await?;
+        let updates = match get_updates(&client, &base, offset).await {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("[telegram] getUpdates error: {err}");
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                continue;
+            }
+        };
 
         if !updates.ok {
-            bail!("Telegram API returned ok=false on getUpdates");
+            eprintln!("[telegram] getUpdates returned ok=false");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            continue;
         }
 
         for update in updates.result {
@@ -128,7 +137,9 @@ pub async fn serve(runtime: AgentRuntime) -> Result<()> {
             let _ = presence_stop_tx.send(());
             let _ = presence_task.await;
 
-            send_message(&client, &base, chat_id, &reply).await?;
+            if let Err(err) = send_message(&client, &base, chat_id, &reply).await {
+                eprintln!("[telegram] sendMessage failed: {err}");
+            }
         }
     }
 }
